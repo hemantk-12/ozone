@@ -2171,6 +2171,7 @@ public final class OzoneManager extends ServiceRuntimeInfoImpl
         multiTenantManager.stop();
       }
       stopTrashEmptier();
+      omSnapshotManager.close();
       metadataManager.stop();
       metrics.unRegister();
       omClientProtocolMetrics.unregister();
