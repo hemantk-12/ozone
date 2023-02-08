@@ -18,8 +18,18 @@
 
 package org.apache.hadoop.ozone.om.snapshot;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Stream;
+import org.apache.hadoop.hdds.StringUtils;
 import org.apache.hadoop.hdds.utils.db.CodecRegistry;
 import org.apache.hadoop.hdds.utils.db.IntegerCodec;
 import org.apache.hadoop.hdds.utils.db.Table;
@@ -35,9 +45,8 @@ import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.SnapshotInfo;
 import org.apache.hadoop.ozone.om.helpers.WithObjectID;
 import org.apache.hadoop.ozone.snapshot.SnapshotDiffReport;
-import org.apache.hadoop.ozone.snapshot.SnapshotDiffReport.DiffType;
 import org.apache.hadoop.ozone.snapshot.SnapshotDiffReport.DiffReportEntry;
-
+import org.apache.hadoop.ozone.snapshot.SnapshotDiffReport.DiffType;
 import org.apache.ozone.rocksdb.util.ManagedSstFileReader;
 import org.apache.ozone.rocksdb.util.RdbUtil;
 import org.apache.ozone.rocksdiff.DifferSnapshotInfo;
@@ -49,39 +58,46 @@ import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Stream;
-
 import static org.apache.hadoop.ozone.OzoneConsts.OM_KEY_PREFIX;
 
 /**
  * Class to generate snapshot diff.
  */
 public class SnapshotDiffManager {
-
   private static final Logger LOG =
           LoggerFactory.getLogger(SnapshotDiffManager.class);
+  private static final String DELIMITER = "-";
+  private static final String FROM_SNAP_TABLE_SUFFIX = "-from-snap";
+  private static final String TO_SNAP_TABLE_SUFFIX = "-to-snap";
+  private static final String UNIQUE_IDS_TABLE_SUFFIX = "-unique-ids";
+  private static final String DELETE_DIFF_TABLE_SUFFIX = "-delete-diff";
+  private static final String RENAME_DIFF_TABLE_SUFFIX = "-rename-diff";
+  private static final String CREATE_DIFF_TABLE_SUFFIX = "-create-diff";
+  private static final String MODIFY_DIFF_TABLE_SUFFIX = "-modify-diff";
+
   private final RocksDBCheckpointDiffer differ;
   private final ManagedRocksDB db;
   private final CodecRegistry codecRegistry;
+  private final ColumnFamilyHandle snapDiffRequestTableColumnFamily;
+  private final ColumnFamilyHandle snapDiffReportTableColumnFamily;
+  private final ManagedColumnFamilyOptions familyOptions;
 
   public SnapshotDiffManager(ManagedRocksDB db,
-                             RocksDBCheckpointDiffer differ) {
+                             RocksDBCheckpointDiffer differ,
+                             ColumnFamilyHandle snapDiffRequestTable,
+                             ColumnFamilyHandle snapDiffReportTable,
+                             ManagedColumnFamilyOptions familyOptions) {
     this.db = db;
     this.differ = differ;
+    this.snapDiffRequestTableColumnFamily = snapDiffRequestTable;
+    this.snapDiffReportTableColumnFamily = snapDiffReportTable;
+    this.familyOptions = familyOptions;
+
     this.codecRegistry = new CodecRegistry();
 
     // Integers are used for indexing persistent list.
-    this.codecRegistry.addCodec(Integer.class,
-        new IntegerCodec());
-    // Need for Diff Report
+    this.codecRegistry.addCodec(Integer.class, new IntegerCodec());
+    // DiffReportEntry codec for Diff Report.
     this.codecRegistry.addCodec(DiffReportEntry.class,
         new OmDBDiffReportEntryCodec());
   }
@@ -116,51 +132,112 @@ public class SnapshotDiffManager {
     final String snapshotId = snapshotInfo.getSnapshotID();
     final long dbTxSequenceNumber = snapshotInfo.getDbTxSequenceNumber();
 
-    return new DifferSnapshotInfo(
-        checkpointPath,
+    return new DifferSnapshotInfo(checkpointPath,
         snapshotId,
         dbTxSequenceNumber,
         getTablePrefixes(snapshotOMMM, volumeName, bucketName));
   }
 
+  @SuppressWarnings("parameternumber")
   public SnapshotDiffReport getSnapshotDiffReport(final String volume,
                                                   final String bucket,
                                                   final OmSnapshot fromSnapshot,
                                                   final OmSnapshot toSnapshot,
                                                   final SnapshotInfo fsInfo,
-                                                  final SnapshotInfo tsInfo)
+                                                  final SnapshotInfo tsInfo,
+                                                  final int index,
+                                                  final int pageSize)
       throws IOException, RocksDBException {
 
-    final BucketLayout bucketLayout = getBucketLayout(volume, bucket,
-        fromSnapshot.getMetadataManager());
+    // TODO: SnapshotId can be used instead of whole path because snapshotId
+    //  is unique.
+    String diffReportKeyInTable = volume + DELIMITER + bucket + DELIMITER +
+        fromSnapshot.getName() + DELIMITER + toSnapshot.getName();
 
-    // TODO: This should comes from request itself.
-    String requestId = UUID.randomUUID().toString();
+    String reportId = getSnapshotDiffReportName(diffReportKeyInTable);
+    boolean diffReportExist = reportId != null;
+
+    reportId = diffReportExist ? reportId :
+        UUID.randomUUID().toString();
+
+    PersistentMap<String, DiffReportEntry> diffReport =
+        new RocksDbPersistentMap<>(db,
+            snapDiffReportTableColumnFamily,
+            codecRegistry,
+            String.class,
+            DiffReportEntry.class);
+
+    // If snapshot diff doesn't exist, we generate the diff report first
+    // and add it to the table for future requests.
+    // TODO: This needs to be re-visited to bypass same request
+    //  based on diff task status.
+    if (!diffReportExist) {
+      getSnapshotDiffReport(reportId, volume, bucket, fromSnapshot,
+          toSnapshot, fsInfo, tsInfo, diffReport);
+      putSnapshotDiffReportName(diffReportKeyInTable, reportId);
+    }
+
+    List<DiffReportEntry> diffReportList = new ArrayList<>();
+
+    boolean hasMoreEntries = true;
+
+    for (int idx = index; idx - index < pageSize; idx++) {
+      DiffReportEntry diffReportEntry =
+          diffReport.get(reportId + DELIMITER + idx);
+      if (diffReportEntry == null) {
+        hasMoreEntries = false;
+        break;
+      }
+      diffReportList.add(diffReportEntry);
+    }
+
+    String tokenString = hasMoreEntries ?
+        String.valueOf(index + pageSize) : null;
+
+    return new SnapshotDiffReport(volume, bucket, fromSnapshot.getName(),
+        toSnapshot.getName(), diffReportList, tokenString);
+  }
+
+  private synchronized String getSnapshotDiffReportName(final String key)
+      throws IOException, RocksDBException {
+    byte[] rawKey = codecRegistry.asRawData(key);
+    byte[] rawValue = db.get().get(snapDiffRequestTableColumnFamily, rawKey);
+    return codecRegistry.asObject(rawValue, String.class);
+  }
+
+  private synchronized void putSnapshotDiffReportName(final String key,
+                                                      final String value)
+      throws IOException, RocksDBException {
+    byte[] rawKey = codecRegistry.asRawData(key);
+    byte[] rawValue = codecRegistry.asRawData(value);
+    db.get().put(snapDiffRequestTableColumnFamily, rawKey, rawValue);
+  }
+
+  @SuppressWarnings("parameternumber")
+  public void getSnapshotDiffReport(
+      final String reportId,
+      final String volume,
+      final String bucket,
+      final OmSnapshot fromSnapshot,
+      final OmSnapshot toSnapshot,
+      final SnapshotInfo fsInfo,
+      final SnapshotInfo tsInfo,
+      final PersistentMap<String, DiffReportEntry> diffReport
+  ) throws IOException, RocksDBException {
 
     ColumnFamilyHandle fromSnapshotColumnFamily = null;
     ColumnFamilyHandle toSnapshotColumnFamily = null;
     ColumnFamilyHandle objectIDsColumnFamily = null;
-    ColumnFamilyHandle diffReportColumnFamily = null;
 
     try {
-      // RequestId is prepended to column family name to make it unique
+      // ReportId is prepended to column families name to make them unique
       // for request.
-      fromSnapshotColumnFamily = db.get().createColumnFamily(
-          new ColumnFamilyDescriptor(
-              codecRegistry.asRawData(requestId + "-fromSnapshot"),
-              new ManagedColumnFamilyOptions()));
-      toSnapshotColumnFamily = db.get().createColumnFamily(
-          new ColumnFamilyDescriptor(
-              codecRegistry.asRawData(requestId + "-toSnapshot"),
-              new ManagedColumnFamilyOptions()));
-      objectIDsColumnFamily = db.get().createColumnFamily(
-          new ColumnFamilyDescriptor(
-              codecRegistry.asRawData(requestId + "-objectIDs"),
-              new ManagedColumnFamilyOptions()));
-      diffReportColumnFamily = db.get().createColumnFamily(
-          new ColumnFamilyDescriptor(
-              codecRegistry.asRawData(requestId + "-diffReport"),
-              new ManagedColumnFamilyOptions()));
+      fromSnapshotColumnFamily =
+          createColumnFamily(reportId + FROM_SNAP_TABLE_SUFFIX);
+      toSnapshotColumnFamily =
+          createColumnFamily(reportId + TO_SNAP_TABLE_SUFFIX);
+      objectIDsColumnFamily =
+          createColumnFamily(reportId + UNIQUE_IDS_TABLE_SUFFIX);
 
       // ObjectId to keyName map to keep key info for fromSnapshot.
       // objectIdToKeyNameMap is used to identify what keys were touched
@@ -190,12 +267,8 @@ public class SnapshotDiffManager {
               codecRegistry,
               Long.class);
 
-      // Final diff report.
-      final PersistentList<DiffReportEntry> diffReport =
-          new RocksDbPersistentList<>(db,
-              diffReportColumnFamily,
-              codecRegistry,
-              DiffReportEntry.class);
+      final BucketLayout bucketLayout = getBucketLayout(volume, bucket,
+          fromSnapshot.getMetadataManager());
 
       final Table<String, OmKeyInfo> fsKeyTable = fromSnapshot
           .getMetadataManager().getKeyTable(bucketLayout);
@@ -215,7 +288,6 @@ public class SnapshotDiffManager {
           false);
 
       if (bucketLayout.isFileSystemOptimized()) {
-        // add to object ID map for directory.
         final Table<String, OmDirectoryInfo> fsDirTable =
             fromSnapshot.getMetadataManager().getDirectoryTable();
         final Table<String, OmDirectoryInfo> tsDirTable =
@@ -234,31 +306,11 @@ public class SnapshotDiffManager {
             true);
       }
 
-      generateDiffReport(requestId,
+      generateDiffReport(reportId,
           objectIDsToCheckMap,
           objectIdToKeyNameMapForFromSnapshot,
           objectIdToKeyNameMapForToSnapshot,
           diffReport);
-
-      // TODO: Need to change it to pagination.
-      //  https://issues.apache.org/jira/browse/HDDS-7548
-      List<DiffReportEntry> diffReportList = new ArrayList<>();
-      diffReport.iterator().forEachRemaining(diffReportList::add);
-
-      return new SnapshotDiffReport(volume,
-          bucket,
-          fromSnapshot.getName(),
-          toSnapshot.getName(),
-          diffReportList);
-
-    } catch (RocksDBException | IOException exception) {
-      // Drop diff report table only if there was any failure in
-      // diff computation.
-      if (diffReportColumnFamily != null) {
-        db.get().dropColumnFamily(diffReportColumnFamily);
-        diffReportColumnFamily.close();
-      }
-      throw exception;
     } finally {
       // Clean up: drop the intermediate column family and close them.
       if (fromSnapshotColumnFamily != null) {
@@ -392,12 +444,12 @@ public class SnapshotDiffManager {
   }
 
   private void generateDiffReport(
-      final String requestId,
+      final String reportId,
       final PersistentSet<Long> objectIDsToCheck,
       final PersistentMap<Long, String> oldObjIdToKeyMap,
       final PersistentMap<Long, String> newObjIdToKeyMap,
-      final PersistentList<DiffReportEntry> diffReport
-  ) throws RocksDBException, IOException {
+      final PersistentMap<String, DiffReportEntry> diffReport
+  ) throws RocksDBException {
 
     ColumnFamilyHandle deleteDiffColumnFamily = null;
     ColumnFamilyHandle renameDiffColumnFamily = null;
@@ -407,22 +459,14 @@ public class SnapshotDiffManager {
     try {
       // RequestId is prepended to column family name to make it unique
       // for request.
-      deleteDiffColumnFamily = db.get().createColumnFamily(
-          new ColumnFamilyDescriptor(
-              codecRegistry.asRawData(requestId + "-deleteDiff"),
-              new ManagedColumnFamilyOptions()));
-      renameDiffColumnFamily = db.get().createColumnFamily(
-          new ColumnFamilyDescriptor(
-              codecRegistry.asRawData(requestId + "-renameDiff"),
-              new ManagedColumnFamilyOptions()));
-      createDiffColumnFamily = db.get().createColumnFamily(
-          new ColumnFamilyDescriptor(
-              codecRegistry.asRawData(requestId + "-createDiff"),
-              new ManagedColumnFamilyOptions()));
-      modifyDiffColumnFamily = db.get().createColumnFamily(
-          new ColumnFamilyDescriptor(
-              codecRegistry.asRawData(requestId + "-modifyDiff"),
-              new ManagedColumnFamilyOptions()));
+      deleteDiffColumnFamily =
+          createColumnFamily(reportId + DELETE_DIFF_TABLE_SUFFIX);
+      renameDiffColumnFamily =
+          createColumnFamily(reportId + RENAME_DIFF_TABLE_SUFFIX);
+      createDiffColumnFamily =
+          createColumnFamily(reportId + CREATE_DIFF_TABLE_SUFFIX);
+      modifyDiffColumnFamily =
+          createColumnFamily(reportId + MODIFY_DIFF_TABLE_SUFFIX);
 
       final PersistentList<DiffReportEntry> deleteDiffs =
           createDiffReportPersistentList(deleteDiffColumnFamily);
@@ -504,10 +548,11 @@ public class SnapshotDiffManager {
        *
        */
 
-      diffReport.addAll(deleteDiffs);
-      diffReport.addAll(renameDiffs);
-      diffReport.addAll(createDiffs);
-      diffReport.addAll(modifyDiffs);
+      int index = 0;
+      index = addToReport(reportId, index, deleteDiffs, diffReport);
+      index = addToReport(reportId, index, renameDiffs, diffReport);
+      index = addToReport(reportId, index, createDiffs, diffReport);
+      addToReport(reportId, index, modifyDiffs, diffReport);
     } finally {
       if (deleteDiffColumnFamily != null) {
         db.get().dropColumnFamily(deleteDiffColumnFamily);
@@ -535,6 +580,26 @@ public class SnapshotDiffManager {
         columnFamilyHandle,
         codecRegistry,
         DiffReportEntry.class);
+  }
+
+  private ColumnFamilyHandle createColumnFamily(String columnFamilyName)
+      throws RocksDBException {
+    return db.get().createColumnFamily(
+        new ColumnFamilyDescriptor(
+            StringUtils.string2Bytes(columnFamilyName),
+            familyOptions));
+  }
+
+  private int addToReport(String reportId, int index,
+                          PersistentList<DiffReportEntry> diffReportEntries,
+                          PersistentMap<String, DiffReportEntry> diffReport) {
+    Iterator<DiffReportEntry> diffReportIterator = diffReportEntries.iterator();
+    while (diffReportIterator.hasNext()) {
+      diffReport.put(reportId + DELIMITER + index,
+          diffReportIterator.next());
+      index++;
+    }
+    return index;
   }
 
   private BucketLayout getBucketLayout(final String volume,

@@ -25,12 +25,18 @@ import com.google.common.cache.RemovalListener;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutionException;
+import java.util.stream.Collectors;
+import org.apache.hadoop.hdds.StringUtils;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.server.ServerUtils;
 import org.apache.hadoop.hdds.utils.db.DBCheckpoint;
 import org.apache.hadoop.hdds.utils.db.RDBStore;
-import org.apache.hadoop.hdds.utils.db.managed.ManagedOptions;
+import org.apache.hadoop.hdds.utils.db.RocksDatabase;
+import org.apache.hadoop.hdds.utils.db.managed.ManagedColumnFamilyOptions;
+import org.apache.hadoop.hdds.utils.db.managed.ManagedDBOptions;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksDB;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
@@ -39,12 +45,15 @@ import org.apache.hadoop.ozone.om.helpers.SnapshotInfo.SnapshotStatus;
 import org.apache.hadoop.ozone.om.snapshot.SnapshotDiffManager;
 import org.apache.hadoop.ozone.snapshot.SnapshotDiffReport;
 import org.apache.ozone.rocksdiff.RocksDBCheckpointDiffer;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.RocksDBException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 
+import static org.apache.hadoop.hdds.utils.db.DBStoreBuilder.DEFAULT_COLUMN_FAMILY_NAME;
 import static org.apache.hadoop.ozone.OzoneConsts.OM_KEY_PREFIX;
 import static org.apache.hadoop.ozone.OzoneConsts.OM_SNAPSHOT_DIFF_DB_NAME;
 import static org.apache.hadoop.ozone.OzoneConsts.OM_SNAPSHOT_INDICATOR;
@@ -62,20 +71,72 @@ public final class OmSnapshotManager implements AutoCloseable {
   private final OzoneManager ozoneManager;
   private final SnapshotDiffManager snapshotDiffManager;
   private final LoadingCache<String, OmSnapshot> snapshotCache;
-  private final ManagedRocksDB snapshotDiffDb;
+  private ManagedRocksDB snapshotDiffDb;
+
+  // Table to keep the reportId and status (Done, InProgress) for snap diff
+  // request. Status can be used to know if similar request is InProgress
+  // or Done to reuse existing report.
+  private static final String SNAP_DIFF_REQUEST_TABLE_NAME =
+      "snap-diff-request-table";
+  // Table to keep diff report across all the snap diff request.
+  // Key in this table with be prefixed with reportId, which will be used to
+  // retrieve data or drop the report during clean up.
+  private static final String SNAP_DIFF_REPORT_TABLE_NAME =
+      "snap-diff-report-table";
+
+  private final ManagedColumnFamilyOptions columnFamilyOptions;
+  private final ManagedDBOptions options;
+
+  // TODO: create config for max allowed page size.
+  private final int maxPageSize = 1000;
 
   OmSnapshotManager(OzoneManager ozoneManager) {
+    this.options = new ManagedDBOptions();
+    this.options.setCreateIfMissing(true);
+    this.columnFamilyOptions = new ManagedColumnFamilyOptions();
+
+    List<ColumnFamilyDescriptor> columnFamilyDescriptors = new ArrayList<>();
+    List<ColumnFamilyHandle> columnFamilyHandles = new ArrayList<>();
+    ColumnFamilyHandle snapDiffRequestColumFamily;
+    ColumnFamilyHandle snapDiffReportColumFamily;
+    String dbPath = getDbPath(ozoneManager.getConfiguration());
+
+    try {
+      // Add default CF
+      columnFamilyDescriptors.add(new ColumnFamilyDescriptor(
+          StringUtils.string2Bytes(DEFAULT_COLUMN_FAMILY_NAME),
+          columnFamilyOptions));
+
+      columnFamilyDescriptors.addAll(getExitingColumnFamilyDescriptors(dbPath));
+
+      this.snapshotDiffDb = createRocksDbForSnapshotDiff(options,
+          dbPath, columnFamilyDescriptors, columnFamilyHandles);
+
+      snapDiffRequestColumFamily =
+          getOrCreateColumnFamily(SNAP_DIFF_REQUEST_TABLE_NAME,
+              columnFamilyDescriptors, columnFamilyHandles);
+      snapDiffReportColumFamily =
+          getOrCreateColumnFamily(SNAP_DIFF_REPORT_TABLE_NAME,
+              columnFamilyDescriptors, columnFamilyHandles);
+
+    } catch (RuntimeException exception) {
+      closeRocksDbObjects(options,
+          columnFamilyOptions,
+          columnFamilyDescriptors,
+          columnFamilyHandles,
+          snapshotDiffDb);
+      throw exception;
+    }
+
     this.ozoneManager = ozoneManager;
+    RocksDBCheckpointDiffer differ = ozoneManager
+        .getMetadataManager()
+        .getStore()
+        .getRocksDBCheckpointDiffer();
 
-    // Pass in the differ
-    final RocksDBCheckpointDiffer differ = ozoneManager
-            .getMetadataManager()
-            .getStore()
-            .getRocksDBCheckpointDiffer();
-
-    this.snapshotDiffDb =
-        createDbForSnapshotDiff(ozoneManager.getConfiguration());
-    this.snapshotDiffManager = new SnapshotDiffManager(snapshotDiffDb, differ);
+    this.snapshotDiffManager = new SnapshotDiffManager(snapshotDiffDb, differ,
+        snapDiffRequestColumFamily, snapDiffReportColumFamily,
+        columnFamilyOptions);
 
     // size of lru cache
     int cacheSize = ozoneManager.getConfiguration().getInt(
@@ -135,6 +196,7 @@ public final class OmSnapshotManager implements AutoCloseable {
                 notification.getKey(), e);
           }
         };
+
     // init LRU cache
     snapshotCache = CacheBuilder.newBuilder()
         .maximumSize(cacheSize)
@@ -181,7 +243,7 @@ public final class OmSnapshotManager implements AutoCloseable {
 
   // Get OmSnapshot if the keyname has ".snapshot" key indicator
   public IOmMetadataReader checkForSnapshot(String volumeName,
-                                     String bucketName, String keyname)
+                                            String bucketName, String keyname)
       throws IOException {
     if (keyname == null) {
       return ozoneManager.getOmMetadataReader();
@@ -245,12 +307,19 @@ public final class OmSnapshotManager implements AutoCloseable {
   public SnapshotDiffReport getSnapshotDiffReport(final String volume,
                                                   final String bucket,
                                                   final String fromSnapshot,
-                                                  final String toSnapshot)
+                                                  final String toSnapshot,
+                                                  final String token,
+                                                  int pageSize)
       throws IOException {
     // Validate fromSnapshot and toSnapshot
     final SnapshotInfo fsInfo = getSnapshotInfo(volume, bucket, fromSnapshot);
     final SnapshotInfo tsInfo = getSnapshotInfo(volume, bucket, toSnapshot);
     verifySnapshotInfoForSnapDiff(fsInfo, tsInfo);
+
+    int index = getIndexFromToken(token);
+    if (pageSize <= 0 || pageSize > maxPageSize) {
+      pageSize = maxPageSize;
+    }
 
     final String fsKey = SnapshotInfo.getTableKey(volume, bucket, fromSnapshot);
     final String tsKey = SnapshotInfo.getTableKey(volume, bucket, toSnapshot);
@@ -258,7 +327,7 @@ public final class OmSnapshotManager implements AutoCloseable {
       final OmSnapshot fs = snapshotCache.get(fsKey);
       final OmSnapshot ts = snapshotCache.get(tsKey);
       return snapshotDiffManager.getSnapshotDiffReport(volume, bucket, fs, ts,
-          fsInfo, tsInfo);
+          fsInfo, tsInfo, index, pageSize);
     } catch (ExecutionException | RocksDBException e) {
       throw new IOException(e.getCause());
     }
@@ -279,27 +348,140 @@ public final class OmSnapshotManager implements AutoCloseable {
     }
   }
 
-  private ManagedRocksDB createDbForSnapshotDiff(OzoneConfiguration config) {
-    final ManagedOptions managedOptions = new ManagedOptions();
-    managedOptions.setCreateIfMissing(true);
-
-    final File dbDirPath =
-        ServerUtils.getDBPath(config, OZONE_OM_SNAPSHOT_DIFF_DB_DIR);
-
-    String dbPath = Paths.get(dbDirPath.toString(), OM_SNAPSHOT_DIFF_DB_NAME)
-        .toFile()
-        .getAbsolutePath();
-
+  private int getIndexFromToken(String token) throws IOException {
+    // Validate that token passed in the request is valid integer as of now.
+    // Later we can change it if we migrate to encrypted or cursor token.
     try {
-      return ManagedRocksDB.open(managedOptions, dbPath);
+      int index = Integer.parseInt(token);
+      if (index < 0) {
+        // Throws NFE which will be transformed to IOException later.
+        throw new NumberFormatException();
+      }
+      return index;
+    } catch (NumberFormatException exception) {
+      throw new IOException("Passed token is invalid. " +
+          "Resend the request with valid token returned in previous request.");
+    }
+  }
+
+  private ManagedRocksDB createRocksDbForSnapshotDiff(
+      ManagedDBOptions dbOptions, String dbPath,
+      List<ColumnFamilyDescriptor> familyDescriptors,
+      List<ColumnFamilyHandle> familyHandles
+  ) {
+    try {
+      return ManagedRocksDB.open(dbOptions,
+          dbPath,
+          familyDescriptors,
+          familyHandles);
     } catch (RocksDBException exception) {
       // TODO: Fail gracefully.
       throw new RuntimeException(exception);
     }
   }
 
+  private String getDbPath(OzoneConfiguration config) {
+    File dbDirPath = ServerUtils.getDBPath(config,
+        OZONE_OM_SNAPSHOT_DIFF_DB_DIR);
+    return Paths.get(dbDirPath.toString(), OM_SNAPSHOT_DIFF_DB_NAME)
+        .toFile().getAbsolutePath();
+  }
+
+  private List<ColumnFamilyDescriptor> getExitingColumnFamilyDescriptors(
+      String path) {
+    try {
+      return RocksDatabase.listColumnFamiliesEmptyOptions(path)
+          .stream()
+          .map(columnFamilyName -> new ColumnFamilyDescriptor(
+              columnFamilyName, columnFamilyOptions))
+          .collect(Collectors.toList());
+    } catch (RocksDBException exception) {
+      // TODO: Fail gracefully.
+      throw new RuntimeException(exception);
+    }
+  }
+
+  /**
+   * Return the column family from column family list if it was existing
+   * column family, otherwise create new column family.
+   * This is for backward and forward compatibility.
+   * For backward compatibility, when column family doesn't exist. it will
+   * create new one and return that.
+   * For forward compatibility, it will return the existing one.
+   */
+  private ColumnFamilyHandle getOrCreateColumnFamily(
+      String columnFamilyName,
+      List<ColumnFamilyDescriptor> familyDescriptors,
+      List<ColumnFamilyHandle> familyHandles) {
+
+    for (int i = 0; i < familyDescriptors.size(); i++) {
+      String cfName = StringUtils.bytes2String(familyDescriptors.get(i)
+          .getName());
+      if (columnFamilyName.equals(cfName)) {
+        return familyHandles.get(i);
+      }
+    }
+
+    try {
+      ColumnFamilyDescriptor columnFamilyDescriptor =
+          new ColumnFamilyDescriptor(StringUtils.string2Bytes(columnFamilyName),
+              columnFamilyOptions);
+      ColumnFamilyHandle columnFamily = snapshotDiffDb.get()
+          .createColumnFamily(columnFamilyDescriptor);
+
+      // Add column family and descriptor so that they can be closed if needed.
+      familyHandles.add(columnFamily);
+      familyDescriptors.add(columnFamilyDescriptor);
+      return columnFamily;
+    } catch (RocksDBException exception) {
+      // TODO: Fail gracefully.
+      throw new RuntimeException(exception);
+    }
+  }
+
+  private void closeRocksDbObjects(
+      ManagedDBOptions managedDBOptions,
+      ManagedColumnFamilyOptions managedColumnFamilyOptions,
+      List<ColumnFamilyDescriptor> columnFamilyDescriptors,
+      List<ColumnFamilyHandle> columnFamilyHandles,
+      ManagedRocksDB managedRocksDB) {
+
+    if (managedDBOptions != null) {
+      managedDBOptions.close();
+    }
+    if (managedColumnFamilyOptions != null) {
+      closeColumnFamilyOptions(managedColumnFamilyOptions);
+    }
+    if (columnFamilyDescriptors != null) {
+      columnFamilyDescriptors.forEach(columnFamilyDescriptor ->
+          closeColumnFamilyOptions((ManagedColumnFamilyOptions)
+              columnFamilyDescriptor.getOptions()));
+    }
+    if (columnFamilyHandles != null) {
+      columnFamilyHandles.forEach(ColumnFamilyHandle::close);
+    }
+    if (managedRocksDB != null) {
+      managedRocksDB.close();
+    }
+  }
+
+  private void closeColumnFamilyOptions(
+      ManagedColumnFamilyOptions managedColumnFamilyOptions) {
+    if (managedColumnFamilyOptions.isReused()) {
+      return;
+    }
+    ManagedColumnFamilyOptions.closeDeeply(managedColumnFamilyOptions);
+  }
+
   @Override
   public void close() {
+    if (options != null) {
+      options.close();
+    }
+    if (columnFamilyOptions != null) {
+      closeColumnFamilyOptions(columnFamilyOptions);
+    }
+
     if (snapshotDiffDb != null) {
       snapshotDiffDb.close();
     }

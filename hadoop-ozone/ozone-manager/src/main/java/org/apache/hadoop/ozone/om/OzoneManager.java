@@ -4324,10 +4324,17 @@ public final class OzoneManager extends ServiceRuntimeInfoImpl
         ozoneObj.getKeyName());
   }
 
-  public SnapshotDiffReport snapshotDiff(String volume, String bucket,
-                                         String fromSnapshot, String toSnapshot)
-      throws IOException {
-    return omSnapshotManager.getSnapshotDiffReport(volume, bucket,
-        fromSnapshot, toSnapshot);
+  public SnapshotDiffReport snapshotDiff(String volume,
+                                         String bucket,
+                                         String fromSnapshot,
+                                         String toSnapshot,
+                                         String token,
+                                         int pageSize) throws IOException {
+    return omSnapshotManager.getSnapshotDiffReport(volume,
+        bucket,
+        fromSnapshot,
+        toSnapshot,
+        token,
+        pageSize);
   }
 }
