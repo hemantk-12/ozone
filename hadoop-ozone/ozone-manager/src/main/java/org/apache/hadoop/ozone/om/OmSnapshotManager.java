@@ -53,6 +53,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nonnull;
 
+import static org.apache.commons.lang3.StringUtils.isBlank;
 import static org.apache.hadoop.hdds.utils.db.DBStoreBuilder.DEFAULT_COLUMN_FAMILY_NAME;
 import static org.apache.hadoop.ozone.OzoneConsts.OM_KEY_PREFIX;
 import static org.apache.hadoop.ozone.OzoneConsts.OM_SNAPSHOT_DIFF_DB_NAME;
@@ -349,6 +350,10 @@ public final class OmSnapshotManager implements AutoCloseable {
   }
 
   private int getIndexFromToken(String token) throws IOException {
+    if (isBlank(token)) {
+      return 0;
+    }
+
     // Validate that token passed in the request is valid integer as of now.
     // Later we can change it if we migrate to encrypted or cursor token.
     try {
