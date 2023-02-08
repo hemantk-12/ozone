@@ -325,6 +325,13 @@ public class SnapshotDiffManager {
         db.get().dropColumnFamily(objectIDsColumnFamily);
         objectIDsColumnFamily.close();
       }
+      // Drop diff report table for now. Otherwise, rocksDb creation will
+      // fail on OM restart because column family already exists.
+      // Will be fixed in pagination PR (Jira: HDDS-7548).
+      if (diffReportColumnFamily != null) {
+        db.get().dropColumnFamily(diffReportColumnFamily);
+        diffReportColumnFamily.close();
+      }
     }
   }
 
