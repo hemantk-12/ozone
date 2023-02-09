@@ -235,7 +235,7 @@ public class SnapshotDiffReport {
         .setToSnapshot(toSnapshot);
     builder.addAllDiffList(diffList.stream().map(DiffReportEntry::toProtobuf)
         .collect(Collectors.toList()));
-    if (token != null) {
+    if (StringUtils.isNotEmpty(token)) {
       builder.setToken(token);
     }
     return builder.build();
@@ -250,7 +250,7 @@ public class SnapshotDiffReport {
         report.getDiffListList().stream()
             .map(DiffReportEntry::fromProtobuf)
             .collect(Collectors.toList()),
-        report.getToken());
+        report.hasToken() ? report.getToken() : null);
   }
 
 }
