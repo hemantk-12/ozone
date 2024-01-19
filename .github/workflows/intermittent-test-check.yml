@@ -119,6 +119,7 @@ jobs:
           distribution: 'temurin'
           java-version: 8
       - name: Execute tests
+        timeout-minutes: 120
         run: |
           test_type=${{ needs.prepare-job.outputs.test_type }}
           args="-DexcludedGroups=unhealthy"
