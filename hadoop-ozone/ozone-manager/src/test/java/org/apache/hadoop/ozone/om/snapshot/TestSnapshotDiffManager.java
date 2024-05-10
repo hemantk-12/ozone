@@ -64,6 +64,7 @@ import org.apache.ozone.rocksdb.util.RdbUtil;
 import org.apache.ozone.rocksdiff.DifferSnapshotInfo;
 import org.apache.ozone.rocksdiff.RocksDBCheckpointDiffer;
 import org.apache.ozone.rocksdiff.RocksDiffUtils;
+import org.apache.ozone.test.GenericTestUtils;
 import org.apache.ratis.util.ExitUtils;
 import org.apache.ratis.util.TimeDuration;
 import jakarta.annotation.Nonnull;
@@ -1307,8 +1308,18 @@ public class TestSnapshotDiffManager {
                 eq(false)),
         10, TimeDuration.ONE_SECOND, null, null);
 
-    SnapshotDiffJob snapDiffJob = getSnapshotDiffJobFromDb(snapshotInfo,
-        snapshotInfoList.get(1));
+    GenericTestUtils.waitFor(
+        () -> {
+          try {
+            SnapshotDiffJob snapDiffJob = getSnapshotDiffJobFromDb(snapshotInfo, snapshotInfoList.get(1));
+            return snapDiffJob != null && snapDiffJob.getStatus() == DONE;
+          } catch (IOException | RocksDBException e) {
+            throw new RuntimeException(e);
+          }
+        },
+        1000, 100_000);
+
+    SnapshotDiffJob snapDiffJob = getSnapshotDiffJobFromDb(snapshotInfo, snapshotInfoList.get(1));
 
     assertEquals(DONE, snapDiffJob.getStatus());
     assertEquals(1L, snapDiffJob.getTotalDiffEntries());
