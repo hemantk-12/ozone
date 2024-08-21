@@ -149,6 +149,7 @@ public class BlockOutputStream extends OutputStream {
   private Pipeline pipeline;
   private final ContainerClientMetrics clientMetrics;
   private boolean allowPutBlockPiggybacking;
+  private boolean supportIncrementalChunkList;
 
   private CompletableFuture<Void> lastFlushFuture;
   private CompletableFuture<Void> allPendingFlushFutures = CompletableFuture.completedFuture(null);
@@ -189,8 +190,13 @@ public class BlockOutputStream extends OutputStream {
     }
     this.containerBlockData = BlockData.newBuilder().setBlockID(
         blkIDBuilder.build()).addMetadata(keyValue);
+    this.pipeline = pipeline;
     // tell DataNode I will send incremental chunk list
-    if (config.getIncrementalChunkList()) {
+    // EC does not support incremental chunk list.
+    this.supportIncrementalChunkList = config.getIncrementalChunkList() &&
+        this instanceof RatisBlockOutputStream && allDataNodesSupportPiggybacking();
+    LOG.debug("incrementalChunkList is {}", supportIncrementalChunkList);
+    if (supportIncrementalChunkList) {
       this.containerBlockData.addMetadata(INCREMENTAL_CHUNK_LIST_KV);
       this.lastChunkBuffer = DIRECT_BUFFER_POOL.getBuffer(config.getStreamBufferSize());
       this.lastChunkOffset = 0;
@@ -223,16 +229,17 @@ public class BlockOutputStream extends OutputStream {
     checksum = new Checksum(config.getChecksumType(),
         config.getBytesPerChecksum());
     this.clientMetrics = clientMetrics;
-    this.pipeline = pipeline;
     this.streamBufferArgs = streamBufferArgs;
     this.allowPutBlockPiggybacking = config.getEnablePutblockPiggybacking() &&
             allDataNodesSupportPiggybacking();
+    LOG.debug("PutBlock piggybacking is {}", allowPutBlockPiggybacking);
   }
 
   private boolean allDataNodesSupportPiggybacking() {
     // return true only if all DataNodes in the pipeline are on a version
     // that supports PutBlock piggybacking.
     for (DatanodeDetails dn : pipeline.getNodes()) {
+      LOG.debug("dn = {}, version = {}", dn, dn.getCurrentVersion());
       if (dn.getCurrentVersion() <
               COMBINED_PUTBLOCK_WRITECHUNK_RPC.toProtoValue()) {
         return false;
@@ -532,7 +539,7 @@ public class BlockOutputStream extends OutputStream {
       BlockData blockData = containerBlockData.build();
       LOG.debug("sending PutBlock {}", blockData);
 
-      if (config.getIncrementalChunkList()) {
+      if (supportIncrementalChunkList) {
         // remove any chunks in the containerBlockData list.
         // since they are sent.
         containerBlockData.clearChunks();
@@ -866,7 +873,7 @@ public class BlockOutputStream extends OutputStream {
     try {
       BlockData blockData = null;
 
-      if (config.getIncrementalChunkList()) {
+      if (supportIncrementalChunkList) {
         updateBlockDataForWriteChunk(chunk);
       } else {
         containerBlockData.addChunks(chunkInfo);
@@ -880,7 +887,7 @@ public class BlockOutputStream extends OutputStream {
         blockData = containerBlockData.build();
         LOG.debug("piggyback chunk list {}", blockData);
 
-        if (config.getIncrementalChunkList()) {
+        if (supportIncrementalChunkList) {
           // remove any chunks in the containerBlockData list.
           // since they are sent.
           containerBlockData.clearChunks();
