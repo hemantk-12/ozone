@@ -18,7 +18,7 @@
 
 import React from 'react';
 import moment from 'moment';
-import { Tooltip, Button, Switch } from 'antd';
+import { Tooltip, Button, Switch, Popover, Alert } from 'antd';
 import { PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons';
 import { withRouter } from 'react-router-dom';
 import { RouteComponentProps } from 'react-router';
@@ -34,6 +34,7 @@ interface IAutoReloadPanelProps extends RouteComponentProps<object> {
   omStatus: string;
   togglePolling: (isEnabled: boolean) => void;
   omSyncLoad: () => void;
+  heatmapHealthCheck: boolean;
 }
 
 class AutoReloadPanel extends React.Component<IAutoReloadPanelProps> {
@@ -43,10 +44,28 @@ class AutoReloadPanel extends React.Component<IAutoReloadPanelProps> {
   };
 
   render() {
-    const { onReload, lastRefreshed, lastUpdatedOMDBDelta, lastUpdatedOMDBFull, isLoading, omSyncLoad, omStatus } = this.props;
+    const {onReload, lastRefreshed, lastUpdatedOMDBDelta, lastUpdatedOMDBFull, isLoading, omSyncLoad, omStatus, heatmapHealthCheck} = this.props;
     const autoReloadEnabled = sessionStorage.getItem('autoReloadEnabled') === 'false' ? false : true;
+    
+    const content = (
+      <div>
+        {heatmapHealthCheck ?
+          <Alert
+            message="Solr is Healthy."
+            description="Heatmap will be Accessible"
+            type="success"
+            showIcon /> :
+          <Alert
+            message="Solr is UnHealthy."
+            description="Heatmap will not be accessible."
+            type="warning"
+            showIcon
+          />}
+      </div>
+    );
 
-    const lastRefreshedText = lastRefreshed === 0 || lastRefreshed === undefined ? 'NA' :
+
+     const lastRefreshedText = lastRefreshed === 0 || lastRefreshed === undefined ? 'NA' :
       (
         <Tooltip
           placement='bottom' title={moment(lastRefreshed).format('ll LTS')}
@@ -85,8 +104,10 @@ class AutoReloadPanel extends React.Component<IAutoReloadPanelProps> {
 
     return (
       <div className='auto-reload-panel'>
-        Auto Refresh
-        &nbsp;<Switch defaultChecked={autoReloadEnabled} size='small' className='toggle-switch' onChange={this.autoReloadToggleHandler} />
+         Alert : <Popover style={{ width: 500 }} content={content} title="Alert Notifications" trigger="hover" placement='bottom'>
+          <span style={{ color: heatmapHealthCheck ? '#1DA57A' : '#f83437' }}>1</span></Popover>
+        &nbsp; | &nbsp; Auto Refresh
+        &nbsp;<Switch defaultChecked={autoReloadEnabled} size='small' className='toggle-switch' onChange={this.autoReloadToggleHandler}/>
         &nbsp; | Refreshed at {lastRefreshedText}
         &nbsp;<Button shape='circle' icon={<ReloadOutlined />} size='small' loading={isLoading} onClick={onReload} />
         {lastUpdatedDeltaFullText}
