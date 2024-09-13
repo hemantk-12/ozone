@@ -182,9 +182,6 @@
     <prometheus.version>0.16.0</prometheus.version>
     <reflections.version>0.10.2</reflections.version>
 
-    <!-- com.google.re2j version -->
-    <re2j.version>1.7</re2j.version>
-
     <!-- ProtocolBuffer version, used to verify the protoc version and -->
     <!-- define the protobuf JAR version                               -->
     <proto2.hadooprpc.protobuf.version>2.5.0</proto2.hadooprpc.protobuf.version>
@@ -946,11 +943,6 @@
         <groupId>com.google.testing.compile</groupId>
         <artifactId>compile-testing</artifactId>
         <version>${compile-testing.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>com.google.re2j</groupId>
-        <artifactId>re2j</artifactId>
-        <version>${re2j.version}</version>
       </dependency>
       <dependency>
         <groupId>com.google.protobuf</groupId>
