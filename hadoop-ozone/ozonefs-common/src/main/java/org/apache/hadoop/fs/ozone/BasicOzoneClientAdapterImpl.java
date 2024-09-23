@@ -55,7 +55,6 @@ import org.apache.hadoop.hdfs.protocol.SnapshotDiffReport;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ozone.OmUtils;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
-import org.apache.hadoop.ozone.OzoneFsServerDefaults;
 import org.apache.hadoop.ozone.client.ObjectStore;
 import org.apache.hadoop.ozone.client.OzoneBucket;
 import org.apache.hadoop.ozone.client.OzoneClient;
@@ -462,11 +461,6 @@ public class BasicOzoneClientAdapterImpl implements OzoneClientAdapter {
     token.setKind(OzoneTokenIdentifier.KIND_NAME);
     return token;
 
-  }
-
-  @Override
-  public OzoneFsServerDefaults getServerDefaults() throws IOException {
-    return objectStore.getServerDefaults();
   }
 
   @Override
