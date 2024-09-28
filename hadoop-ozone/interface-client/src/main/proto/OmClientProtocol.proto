@@ -149,6 +149,7 @@ enum Type {
   RenameSnapshot = 131;
 
   ListOpenFiles = 132;
+  SnapshotMoveTableKeys = 137;
 }
 
 enum SafeMode {
@@ -287,6 +288,7 @@ message OMRequest {
   optional RenameSnapshotRequest            RenameSnapshotRequest          = 129;
 
   optional ListOpenFilesRequest             ListOpenFilesRequest           = 130;
+  optional SnapshotMoveTableKeysRequest     SnapshotMoveTableKeysRequest   = 135;
 }
 
 message OMResponse {
@@ -867,6 +869,7 @@ message SnapshotInfo {
   optional uint64 exclusiveReplicatedSize = 18;
   // note: shared sizes can be calculated from: referenced - exclusive
   optional bool deepCleanedDeletedDir = 19;
+  optional bytes lastTransactionInfo = 20;
 }
 
 message SnapshotDiffJobProto {
@@ -1359,6 +1362,8 @@ message PurgeKeysRequest {
     // if set, will purge keys in a snapshot DB instead of active DB
     optional string snapshotTableKey = 2;
     repeated SnapshotMoveKeyInfos keysToUpdate = 3;
+    // previous snapshotID can also be null & this field would be absent in older requests.
+    optional NullableUUID expectedPreviousSnapshotID = 4;
 }
 
 message PurgeKeysResponse {
@@ -1381,6 +1386,12 @@ message PurgePathsResponse {
 message PurgeDirectoriesRequest {
   repeated PurgePathRequest deletedPath = 1;
   optional string snapshotTableKey = 2;
+  // previous snapshotID can also be null & this field would be absent in older requests.
+  optional NullableUUID expectedPreviousSnapshotID = 3;
+}
+
+message NullableUUID {
+  optional hadoop.hdds.UUID uuid = 1;
 }
 
 message PurgeDirectoriesResponse {
@@ -1959,6 +1970,13 @@ message SnapshotMoveDeletedKeysRequest {
   repeated SnapshotMoveKeyInfos reclaimKeys = 3;
   repeated hadoop.hdds.KeyValue renamedKeys = 4;
   repeated string deletedDirsToMove = 5;
+}
+
+message SnapshotMoveTableKeysRequest {
+  optional hadoop.hdds.UUID fromSnapshotID = 1;
+  repeated SnapshotMoveKeyInfos deletedKeys = 2;
+  repeated SnapshotMoveKeyInfos deletedDirs = 3;
+  repeated hadoop.hdds.KeyValue renamedKeys = 4;
 }
 
 message SnapshotMoveKeyInfos {
