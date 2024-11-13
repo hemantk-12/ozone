@@ -15,7 +15,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>org.apache.ozone</groupId>
   <artifactId>ozone-main</artifactId>
-  <version>1.3.0.7.3.1.0-SNAPSHOT</version>
+  <version>1.3.0.7.3.2.0-SNAPSHOT</version>
   <description>Apache Ozone Main</description>
   <name>Apache Ozone Main</name>
   <packaging>pom</packaging>
@@ -60,11 +60,11 @@
 
   <properties>
     <hadoop2.version>2.10.2</hadoop2.version>
-    <hadoop.version>3.1.1.7.3.1.0-SNAPSHOT</hadoop.version>
+    <hadoop.version>3.1.1.7.3.2.0-SNAPSHOT</hadoop.version>
 
     <!-- version for hdds/ozone components -->
     <hdds.version>${ozone.version}</hdds.version>
-    <ozone.version>1.3.0.7.3.1.0-SNAPSHOT</ozone.version>
+    <ozone.version>1.3.0.7.3.2.0-SNAPSHOT</ozone.version>
     <ozone.release>Indiana Dunes</ozone.release>
     <declared.hdds.version>${hdds.version}</declared.hdds.version>
     <declared.ozone.version>${ozone.version}</declared.ozone.version>
@@ -72,13 +72,13 @@
     <!-- HDDS Rocks Native dependency version-->
     <hdds.rocks.native.version>${hdds.version}</hdds.rocks.native.version>
     <!-- Apache Ratis version -->
-    <ratis.version>2.4.2.7.3.1.0-SNAPSHOT</ratis.version>
+    <ratis.version>2.4.2.7.3.2.0-SNAPSHOT</ratis.version>
 
     <!-- Apache Ratis thirdparty version -->
-    <ratis.thirdparty.version>1.0.3.7.3.1.0-SNAPSHOT</ratis.thirdparty.version>
+    <ratis.thirdparty.version>1.0.3.7.3.2.0-SNAPSHOT</ratis.thirdparty.version>
 
     <!-- Apache Ranger plugin version -->
-    <ranger.version>2.4.0.7.3.1.0-SNAPSHOT</ranger.version>
+    <ranger.version>2.4.0.7.3.2.0-SNAPSHOT</ranger.version>
 
     <distMgmtSnapshotsId>apache.snapshots.https</distMgmtSnapshotsId>
     <distMgmtSnapshotsName>Apache Development Snapshot Repository</distMgmtSnapshotsName>
@@ -100,7 +100,7 @@
     <jetty.version>9.4.54.v20240208</jetty.version>
     <java.dev.jna.version>5.2.0</java.dev.jna.version>
     <jcip-annotations.version>1.0-1</jcip-annotations.version>
-    <curator.version>5.4.0.7.3.1.0-SNAPSHOT</curator.version>
+    <curator.version>5.4.0.7.3.2.0-SNAPSHOT</curator.version>
 
     <!-- number of threads/forks to use when running tests in parallel, see parallel-tests profile -->
     <testsThreadCount>4</testsThreadCount>
@@ -207,7 +207,7 @@
     <mockito.version>4.11.0</mockito.version>
     <hamcrest.version>2.2</hamcrest.version>
     <junit5.version>5.10.3</junit5.version>
-    <zookeeper.version>3.8.1.7.3.1.0-SNAPSHOT</zookeeper.version>
+    <zookeeper.version>3.8.1.7.3.2.0-SNAPSHOT</zookeeper.version>
 
     <!-- Maven protoc compiler -->
     <protobuf-maven-plugin.version>0.6.1</protobuf-maven-plugin.version>
