@@ -78,7 +78,7 @@
     <ratis.thirdparty.version>1.0.6.7.3.2.0-SNAPSHOT</ratis.thirdparty.version>
 
     <!-- Apache Ranger plugin version -->
-    <ranger.version>2.4.0.7.3.2.0-SNAPSHOT</ranger.version>
+    <ranger.version>2.6.0.7.3.2.0-SNAPSHOT</ranger.version>
 
     <distMgmtSnapshotsId>apache.snapshots.https</distMgmtSnapshotsId>
     <distMgmtSnapshotsName>Apache Development Snapshot Repository</distMgmtSnapshotsName>
