@@ -1,0 +1,353 @@
+---
+title: Container Reconciliation
+summary: Allow Datanodes to reconcile mismatched container contents regardless of their state.
+date: 2025-04-01
+jira: HDDS-10239
+status: draft
+---
+<!--
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License. See accompanying LICENSE file.
+-->
+
+# Container Reconciliation
+This document outlines the design for handling partial writes in Erasure Coded (EC) data layouts in Ozone using a Merkle tree-based reconciliation mechanism. The goal is to ensure data consistency and recoverability when partial writes occur due to node failures, network partitions, or other transient issues.
+
+## Background
+Unlike a replicated cluster, where data is fully copied across multiple nodes, an Erasure Coded (EC) layout distributes data across multiple DataNodes with parity blocks computed for fault tolerance. The data distribution makes it challenging to apply the same Merkle tree generation method used for replicated clusters. In an EC layout, simply deriving a container’s checksum from its block checksums and a block’s checksum from its chunk checksums is not sufficient. This document proposes a method for generating the Merkle tree and container checksum specifically for EC layouts. And how that can be used to reconcile mismatched container contents.
+
+## Nomenclature
+1. Stripe: A set of data blocks and parity blocks that together form an EC container.
+2. ReplicaIndex: The ordered index of DataNodes that comprise an EC container.
+3. BlockGroupLen: The total bytes of all data blocks in an EC container’s stripe.
+4. BlockSize: The size of each block in a replica of a stripe.
+
+## Guiding Principles
+In addition to the principles for replicated containers, the following guidelines will steer the design and implementation for EC container reconciliation:
+
+1. **Reconciliation over cleaning**:  The process should focus on ensuring that the data is recoverable and consistent across the replicas rather than cleaning the partially written or duplicate data.
+    - For example, the aim is not to clean up a partially written stripe caused by a node failure or network partition.
+
+## Salient points
+- Each Datanode can detect a hole in a block and any checksum mismatches without checking across datanodes.
+- Even if there is no chunk written, a PutBlock is issued and an entry is added to the datanode.
+- Each Datanode can count the number of chunks in a cell as long as the client was able to complete all PutBlocks.
+- Reconstruction of a replica index is atomic. The container is made available for reporting to SCM only after all blocks have been repaired.
+
+## Challenges
+To independently detect corruption or missing data on a DataNode, simply deriving a container’s checksum from block checksums and a block’s checksum from chunk data checksums is insufficient in an EC layout. This is because data is distributed across multiple nodes, with each node storing different chunks.
+Instead, we can generate the container checksum using a metadata checksum, which is sufficient to detect mismatches across replicas. As long as a DataNode’s RocksDB remains healthy, the metadata checksum can be trusted to identify inconsistencies across replicas. This checksum is computed based on the chunk’s offset and its health status.
+However, even though the container checksum can be generated from metadata, a mismatch may still occur if the last chunk doesn't exist from all DataNodes in the last stripe due to insufficient data. To address this, we need a mechanism to handle such cases, potentially by adding padding at the DataNode when necessary.
+
+**Let's consider a few scenarios to understand the challenges:**
+* Case #1: Chunks exist  in all replicas of the last stripe for Block ID 1.
+* Case #2: Last chunk doesn't exist for third replica of the last stripe for Block ID 2.
+* Case #3: Last chunk doesn't exist for second and third replicas of the last stripe for Block ID 3.
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|---------------------------------------------------|
+| **Block ID 1**        |                  |
+| WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             | r2c3             | r3c3             | r4c3                        | r5c3                        | Entire Row written                                |
+| PutBlock 1            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | PutBlock sent to all node                         |
+| **Block ID 2**        |
+| WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             | r2c3             |                  | r4c3                        | r5c3                        | Entire Row written (Partial Row written)          |
+| PutBlock 3            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
+| **Block ID 3**        |
+| WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             |                  |                  | r4c3                        | r5c3                        | Entire Row written (Partial Row written)          |
+| PutBlock 2            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
+
+For Block ID 2 and Block ID 3, block checksum will not match across the replicas because last chunk is not present everywhere in the last stripe. It will trigger a false alarm for SCM to start the reconciliation process. To avoid this, we need to add padding at the DataNode when necessary.
+
+## Proposed Solution
+Proposals to avoid false alarms and handle the challenges mentioned above.
+
+### 1. Use Replication Configuration for Padding (Preferred)
+At the end of a block, a `putBlock` is sent to all replica indexes with the `blockGroupLength` after the last stripe. By leveraging the `blockGroupLength` and the replication configuration, we can determine whether padding is needed.
+
+#### Steps
+1. **Calculate Total Chunks:** Compute the total number of chunks as the ceiling of `blockGroupLength` divided by the `chunkSize`.
+2. **Determine Last Replica Index:** Find the last replica index using the modulus of `totalChunks` by the number of data nodes (excluding parity nodes).
+3. **Compute the Number of Rows:** Determine the total number of rows by taking the ceiling of `totalChunks` divided by the number of data nodes (excluding parity nodes).
+
+#### **Example Calculation:**
+Replication configuration: **3-2-1024** and blockGroupLength: **6400**
+
+Given: `blockGroupLength = 6400`, `chunkSize = 1024`, `dataNodes = 3`, `parityNodes = 2`
+
+- Total chunk = ceil(6400 / 1024) = 7
+- Last replica index = 7 mod 3 = 1
+- Last row = ceil(7 / 3) = 3
+
+This means the last chunk is present in **row 3, replica index 1**. However, since data is striped across multiple nodes, **padding must be added** for replica indexes **2 and 3** to ensure consistency of container checksum.
+
+**Cons:**
+1. Call to SCM to get the replication configuration for padding calculation.
+
+### 2. Stripe Checksum for Padding Calculation
+In EC, a stripe checksum is generated and stored after each successful stripe write which is used to verify the stripe’s health and consistency across all replicas during reads and reconstruction. We can use it to determine whether padding is required or not for the last stripe on a replica because a stripe checksum is nothing but a successful row completion. If stripe checksum is present but chunkInfo is not, it means padding is required to generate metadata checksum.
+
+#### Steps
+1. At the chunk level, the stripe checksum will be used to determine whether padding is needed for the last stripe, as it is always available regardless of whether the chunk has been written or not.
+2. At the block level, if the replica node has successfully processed `putBlock` operations, it can be assumed that the stripe checksums are accurate.
+3. Once the checksums are obtained, scanner can compute the padding requirements for the last stripe accordingly.
+
+An alternative approach is for the client to send the stripe checksum along with the stripe (row) offset. This would eliminate the need to rely on the stripe checksum for determining whether padding is required.
+
+**Cons:**
+1. Client change to store stripe checksum on all the replica nodes.
+2. Currently, the stripe checksum is stored on the first replica node and parity nodes. To maintain backward compatibility, a request will be made to the replica nodes to retrieve and populate the missing stripe checksums on replica indexes where they are not stored.
+
+### 3. Reconciliation Process and Padding for the Last Stripe
+This approach is similar to second approach, but the reconciliation process is responsible for adding padding to the last stripe, rather than the scanner handling the calculation. 
+
+#### Steps
+1. The scanner generates the container checksum based on the blocks and chunks available on the DataNode.
+2. The reconciler fetches the blocks from replica nodes in case checksum mismatches and determines whether padding is required for the last stripe.
+3. If necessary, the reconciler will apply the appropriate padding to ensure consistency across replicas.
+
+**Cons:**
+1. False alarm and unnecessary load on the reconciler.
+2. Client change to store stripe checksum on all the replica nodes to avoid data node call from going forward.
+
+### Decision
+Even though an extra call is made to SCM, first approach is simplest and efficient. It is also similar to what current replication does in case of replica is lost and can reuse the existing logic. Hence, going with this proposal.
+
+## Merkle Tree for EC Containers
+This proposal extends the container-reconciliation approach used for replicated containers to EC containers. Like replicated containers, a container-level checksum is generated to verify whether the container instances are consistent. This container checksum can be defined as a three level Merkle tree.
+
+1. Level 1 (leaves): Rather than using data checksum, in EC metadata checksum will be used. Metadata checksum will be calculated based on the offset of the chunk and the health of the chunk. Health of the chunk represents that a chunk’s checksum matches the expected value (as written by the client and verified by the DataNode container scanner).
+2. Level 2: A block level checksum created by hashing all the chunk checksums within the block.
+   - In an EC container, a putBlock is sent to all replica indexes including parities which contains the blockGroupLen and block offset.
+3. Level 3 (root): A container-level checksum is generated by hashing together all the block-level checksums within the container.
+   - This top-level container hash is reported to the SCM to detect any diverged replicas, eliminating the need for SCM to process block- or chunk-level hashes.
+
+SCM will use this container hash to identify diverged replicas and trigger reconciliation on the datanodes.
+
+## Solution Implementation
+The structure of the Merkle Tree and its storage mechanism on DataNodes mostly remain unchanged. The only difference is in how the Merkle Tree is computed for EC containers. For details on Merkle Tree storage, APIs, and the reconciliation process, refer to the container-reconciliation doc.
+
+```aiignore
+message ChunkMerkleTree {
+  optional int64 offset = 1;
+  optional int64 length = 2;
+  optional int64 chunkChecksum = 3;
+  optional int64 metadataChecksum = 4; # new attribute, based on chunk offset and health of the chunk.
+  optional int64 isHealthy = 5; # new attribute, true if chunk checksum matches with the RocksDB's value.
+}
+
+message BlockMerkleTree {
+  optional int64 blockID = 1;
+  optional int64 blockChecksum = 2;
+  repeated ChunkMerkleTree chunkMerkleTree = 3;
+}
+
+message ContainerMerkleTree {
+  optional int64 dataChecksum = 1;
+  repeated BlockMerkleTree blockMerkleTree = 2;
+}
+
+message ContainerChecksumInfo {
+  optional int64 containerID = 1;
+  optional ContainerMerkleTree containerMerkleTree = 2;
+  repeated int64 deletedBlocks = 3;
+}
+```
+
+## Reconciliation for Erasure Coded containers
+Reconciliation for EC containers can occur in two scenarios:
+1. Healthy Stripe with Unhealthy Replicas:
+   - When a stripe remains healthy but one or more replicas are not, reconciliation is triggered on the DataNode with the unhealthy replica.
+   - The DataNode retrieves the missing or corrupted data from other DataNodes and parity blocks to reconstruct a valid replica.
+   - The reconciler generates a healthy stripe, updates the storage accordingly, and modifies the Merkle Tree to reflect the current state of the data. The container checksum is then updated to reflect these changes.
+
+2. Unhealthy or Unrecoverable Stripe:
+   - If a stripe becomes unrecoverable due to an insufficient number of healthy replicas, reconciliation updates the Block Data to indicate its unrecoverable status. This ensures:
+        - Chunks are not deleted unless the block is explicitly deleted by SCM.
+        - The possibility of future recovery if a new DataNode later rejoins the cluster with a valid replica containing missing chunks or blocks.
+   - If a duplicate replica is detected within the cluster, the reconciliation process first merges the duplicate replicas before attempting stripe reconstruction if necessary.
+
+## Sample scenarios
+
+### Healthy Stripe with Unhealthy Replicas but Recoverable:
+Consider a 3-2 EC layout, where 3 data nodes have replica indexes r1, r2, & r3 and 2 parity nodes have replica indexes r4 and r5. Now, let's examine the possible scenarios:
+1. **Container is missing or has corrupted chunks**: 
+ 
+   | Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                                                    |
+   |-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|--------------------------------------------------------------------------|
+   | **Block ID 1**        |                  |
+   | WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                                       |
+   | WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                                       |
+   | WriteChunk 3          | r1c3 (corrupted) | r2c3             | r3c3             | r4c3                        | r5c3                        | Entire Row written (has corrupted but recoverable chunk)                 |
+   | PutBlock 1            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | PutBlock sent to all node                                                |
+   | **Block ID 2**        |
+   | WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                                       |
+   | WriteChunk 2          | r1c2 (corrupted) | r2c2 (corrupted) |                  | r4c1                        | r5c2                        | Entire Row written (partial row written, corrupted but recoverable chunk |
+   | PutBlock 3            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node                        |
+   | **Block ID 3**        |
+   | WriteChunk 1          | r1c1             |                  |                  | r4c1 (missing)              | r5c1                        | Entire Row written (partial row written, missing but recoverable chunk)  |
+   | PutBlock 2            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node                        |
+
+In all the above scenarios, stripe is healthy and recoverable. On a datanode, reconciliation process will indentify the missing or corrupted chunk/s and then fetch the data form healthy replicas/parities to generate the missing or corrupted chunk/s. It will also update the block level checksum in the Merkle tree to reflect that stripe is healthy and recovered.
+
+2. **Container has corrupted blocks**: 
+    Corrupted block is nothing but an extended case of missing or corrupted chunks. In this case, reconciliation process will fetch block's data chunk by chunk, and reconstruct the block and then mark the stripe as healthy.
+
+3. **PutBlock is missing**:
+   In case the last row cannot be recovered in a different scenario.
+
+### Unhealthy Stripe with Unhealthy Replicas:
+A stripe is unhealthy when there are not enough healthy data and parity blocks to reconstruct the row. The reconciler will mark the stripe as unhealthy to reflect the unrecoverable status.
+In this example, WriteChunk 3 does not have enough healthy data and parity blocks to reconstruct the row, hence reconciler will just mark it as unrecoverable. 
+
+| Client->Datanode APIs | Replica Index r1          | **Replica Index r2**      | Replica Index r3     | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                                                   |
+|-----------------------|---------------------------|---------------------------|----------------------|-----------------------------|-----------------------------|-------------------------------------------------------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1                      | r2c1                      | r3c1                 | r4c1                        | r5c1                        | Entire Row written                                                      |
+| WriteChunk 2          | r1c2                      | r2c2                      | r3c2                 | r4c2                        | r5c2                        | Entire Row written                                                      |
+| WriteChunk 3          | r1c3 (corrupted)          | r2c3 (corrupted)          |                      | r4c3 (corrupted)            | r5c3                        | Row is unrecoverable because there aren't enough data and parity blocks |
+| PutBlock              | PutBlock                  | PutBlock                  | PutBlock             | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node                       |
+| Metadata Checksum     | value1 (offset 3 corrupt) | value1 (offset 3 corrupt) | value3 (no offset 3) | value1 (offset 3 corrupt)   | value2 (ok)                 | Metadata checksum match                                                 |
+
+As mentioned above, it will not clean up the chunks or blocks unless explicitly deleted by SCM because if duplicate replica shows up in the cluster, a row can be reconstructed. Reconciler will first merge the two duplicate replicas and then retry a row reconstruction if they are enough healthy data and parities for reconstruction. In the following example, duplicate replica for r2 shows up in the cluster.
+
+| Client->Datanode APIs | Replica Index r1          | **Replica Index r2**      | **Replica Index r2 duplicate** | Replica Index r3     | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                                   |
+|-----------------------|---------------------------|---------------------------|--------------------------------|----------------------|-----------------------------|-----------------------------|---------------------------------------------------------|
+| **Block ID**          |
+| WriteChunk 1          | r1c1                      | r2c1                      | r2c1                           | r3c1                 | r4c1                        | r5c1                        | Entire Row written                                      |
+| WriteChunk 2          | r1c2                      | r2c2                      | r2c2                           | r3c2                 | r4c2                        | r5c2                        | Entire Row written                                      |
+| WriteChunk 3          | r1c3 (corrupted)          | r2c3 (corrupted)          | r2c3                           |                      | r4c3 (corrupted)            | r5c3                        | Row is now recoverable due to duplicate replica index 2 |
+| PutBlock 4            | PutBlock                  | PutBlock                  | PutBlock                       | PutBlock             | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node       |
+| Metadata Checksum     | value1 (offset 3 corrupt) | value1 (offset 3 corrupt) | value2 (ok)                    | value3 (no offset 3) | value1 (offset 3 corrupt)   | value2 (ok)                 | Metadata checksum match                                 |
+
+Reconciler merges duplicate replica indexes (runs once per datanode)
+
+| Client->Datanode APIs | Replica Index r1          | **Replica Index r2 merged** | **Replica Index r2 merged** | Replica Index r3     | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|---------------------------|-----------------------------|-----------------------------|----------------------|-----------------------------|-----------------------------|---------------------------------------------------|
+| **Block ID**          |
+| WriteChunk 1          | r1c1                      | r2c1                        | r2c1                        | r3c1                 | r4c1                        | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2                      | r2c2                        | r2c2                        | r3c2                 | r4c2                        | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3 (corrupted)          | r2c3                        | r2c3                        |                      | r4c3 (corrupted)            | r5c3                        | The two duplicate index merged                    |
+| PutBlock 4            | PutBlock                  | PutBlock                    | PutBlock                    | PutBlock             | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
+| Metadata Checksum     | value1 (offset 3 corrupt) | value2 (ok)                 | value2 (ok)                 | value3 (no offset 3) | value1 (offset 3 corrupt)   | value2  (ok)                | Metadata checksum match                           |
+
+After the merge, reconciler repairs the unhealthy block
+
+| Client->Datanode APIs | Replica Index 1 | **Replica Index 2 merged** | **Replica Index 2 merged** | Replica Index 3                                    | Replica Index 4 (Parity 1) | Replica Index 5 (Parity 2) | Notes                                             |
+|-----------------------|-----------------|----------------------------|----------------------------|----------------------------------------------------|----------------------------|----------------------------|---------------------------------------------------|
+| **Block ID**          |
+| WriteChunk 1          | r1c1            | r2c1                       | r2c1                       | r3c1                                               | r4c1                       | r5c1                       | Entire Row written                                |
+| WriteChunk 2          | r1c2            | r2c2                       | r2c2                       | r3c2                                               | r4c2                       | r5c2                       | Entire Row written                                |
+| WriteChunk 3          | r1c3            | r2c3                       | r2c3                       |                                                    | r4c3                       | r5c3                       | The metadata checksum match                       |
+| PutBlock 4            | PutBlock        | PutBlock                   | PutBlock                   | PutBlock                                           | PutBlock                   | PutBlock                   | Partial Row written but PutBlock sent to all node |
+| Metadata Checksum     | value2 (ok)     | value2 (ok)                | value2  ok)                | value2 (everything ok, last put block is the same) | valuer2 (everything ok)    | value2 (everything ok)     | Metadata checksum match                           |
+
+
+### PutBlock is missing:
+There could be a cases where block's checksum does not match because PutBlock is missing for the majority of the stripe but chunks are healthy. In that cases, reconciler can generate the stripe checksum and compare it against the stripe checksum written to healthy replicas. If stripe checksum matches, it will issue PutBlock commands to all the replica indexes missing PutBlock.
+Case #1: PutBlock is missing on majority of the DataNodes
+
+| Client->Datanode APIs | Replica Index r1 | **Replica Index r2** | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|----------------------|------------------|-----------------------------|-----------------------------|---------------------------------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1             | r2c1                 | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2                 | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             | r2c3                 | r3c3             | r4c3                        | r5c3                        | Entire Row written                                |
+| PutBlock              | PutBlock         |                      |                  |                             | PutBlock                    | PutBlock is missing on majority of the DataNodes. |
+| Metadata Checksum     | value1 (ok)      | value2               | value2           | value2                      | value1 (ok)                 | Metadata checksum match                           |
+
+Post reconcile, PutBlock is sent to all replicas
+
+| Client->Datanode APIs | Replica Index r1 | **Replica Index r2** | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|----------------------|------------------|-----------------------------|-----------------------------|---------------------------------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1             | r2c1                 | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2                 | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             | r2c3                 | r3c3             | r4c3                        | r5c3                        | Entire Row written                                |
+| PutBlock              | PutBlock         | PutBlock             | PutBlock         | PutBlock                    | PutBlock                    | PutBlock is missing on majority of the DataNodes. |
+| Metadata Checksum     | value1 (ok)      | value1 (ok)          | value1 (ok)      | value1 (ok)                 | value1 (ok)                 | Metadata checksum match                           |
+
+Case #2: Last chunk and PutBlock are missing across multiple replica indexes such that the chunk cannot be recovered.
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                       |
+|-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|-----------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written          |
+| WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written          |
+| WriteChunk 3          | r1c3             |                  |                  |                             | r5c3                        | The metadata checksum match |
+| PutBlock 4            | PutBlock         |                  |                  |                             | PutBlock                    | Partial Row written         |
+| Metadata Checksum     | value2 (ok)      | value1           | value1           | value1                      | value2 (ok)                 | value2 (ok)                 | 
+
+Post reconcile, PutBlock is sent to all replicas but last chunk is still missing on replica index 4
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1)             | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|------------------|------------------|-----------------------------------------|-----------------------------|---------------------------------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                                    | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                                    | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             |                  |                  |                                         | r5c3                        | The metadata checksum match                       |
+| PutBlock 4            | PutBlock         | PutBlock         | PutBlock         | PutBlock                                | PutBlock                    | Partial Row written but PutBlock sent to all node |
+| Metadata Checksum     | value2 (ok)      | value2 (ok)      | value2 (ok)      | value2 (ok, last put block is the same) | value2 (ok)                 | value2 (ok)                                       |
+
+A second round of scanner and reconcile will reconstruct the missing r4c3.
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|---------------------------------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             |                  |                  | r4c3                        | r5c3                        | The metadata checksum match                       |
+| PutBlock 4            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
+| Metadata Checksum     | value2 (ok)      | value2 (ok)      | value2 (ok)      | value2 (ok)                 | value2 (ok)                 | value2 (ok)                                       |
+
+Case #3: PutBlock is missing across multiple replica indexes and chunks are missing/corrupted across multiple rows but block is recoverable because the majority of replicas are healthy in each row.
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                    |
+|-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|--------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1             | r2c1 (corrupted) | r3c1 (corrupted) | r4c1                        | r5c1                        | Entire Row written       |
+| WriteChunk 2          | r1c2             | r2c2 (corrupted) | r3c2 (corrupted) | r4c2                        | r5c2                        | Entire Row written       |
+| WriteChunk 3          | r1c3             |                  |                  | Missing                     | r5c3                        | Partial Row written      |
+| PutBlock 4            | PutBlock         |                  |                  |                             | PutBlock                    | Partial PutBlock written |
+| Metadata Checksum     | value2 (ok)      | value1           | value1           | value1                      | value2 (ok)                 | value2 (ok)              | 
+
+Post reconcile, PutBlock is sent to all replicas missing PutBlock but last chunk is still missing on replica index 4
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1)             | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|------------------|------------------|-----------------------------------------|-----------------------------|---------------------------------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1             | r2c1 (corrupted) | r3c1 (corrupted) | r4c1                                    | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2 (corrupted) | r3c2 (corrupted) | r4c2                                    | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             |                  |                  |                                         | r5c3                        | Partial Row written                               |
+| PutBlock 4            | PutBlock         | PutBlock         | PutBlock         | PutBlock                                | PutBlock                    | Partial Row written but PutBlock sent to all node |
+| Metadata Checksum     | value2 (ok)      | value2 (ok)      | value2 (ok)      | value2 (ok, last put block is the same) | value2 (ok)                 | value2 (ok)                                       |
+
+A second round of scanner and reconcile will reconstruct the missing r4c3.
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|---------------------------------------------------|
+| **Block**             |
+| WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
+| WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
+| WriteChunk 3          | r1c3             |                  |                  | r4c3                        | r5c3                        | The metadata checksum match                       |
+| PutBlock 4            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
+| Metadata Checksum     | value2 (ok)      | value2 (ok)      | value2 (ok)      | value2 (ok)                 | value2 (ok)                 | value2 (ok)                                       |
+
+## Events
+
+### Reconciliation Events
+
