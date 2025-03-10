@@ -20,7 +20,7 @@ package org.apache.hadoop.ozone.recon.fsck;
 
 import static org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor.THREE;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.hadoop.ozone.recon.schema.ContainerSchemaDefinition.UnHealthyContainerStates.ALL_REPLICAS_UNHEALTHY;
+import static org.hadoop.ozone.recon.schema.ContainerSchemaDefinition.UnHealthyContainerStates.ALL_REPLICAS_BAD;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -28,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.times;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.mock;
@@ -215,7 +216,7 @@ public class TestContainerHealthTask extends AbstractReconSqlDBTest {
 
     List<UnhealthyContainers> unhealthyContainers =
         containerHealthSchemaManager.getUnhealthyContainers(
-            ALL_REPLICAS_UNHEALTHY, 0, Integer.MAX_VALUE);
+            ALL_REPLICAS_BAD, 0, Integer.MAX_VALUE);
     assertEquals(1, unhealthyContainers.size());
     assertEquals(2L,
         unhealthyContainers.get(0).getContainerId().longValue());
@@ -426,7 +427,7 @@ public class TestContainerHealthTask extends AbstractReconSqlDBTest {
         unhealthyContainer.setReplicaDelta(0);
         break;
 
-      case ALL_REPLICAS_UNHEALTHY:
+      case ALL_REPLICAS_BAD:
         unhealthyContainer.setExpectedReplicaCount(3);
         unhealthyContainer.setActualReplicaCount(0);
         unhealthyContainer.setReplicaDelta(3);
