@@ -26,5 +26,5 @@ fi
 
 mvn -V -B -DskipShade -DskipTests -Dskip.npx -Dskip.installnpx --no-transfer-progress \
   -Dsonar.coverage.jacoco.xmlReportPaths="$(pwd)/target/coverage/all.xml" \
-  -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=apache -Dsonar.projectKey=hadoop-ozone \
-  verify org.sonarsource.scanner.maven:sonar-maven-plugin:3.6.0.1398:sonar
+  -Dsonar.host.url=https://sonarqube.infra.cloudera.com -Dsonar.projectKey=ozone_ut_cdh_main \
+  -Dsonar.projectName=Ozone_UT verify org.sonarsource.scanner.maven:sonar-maven-plugin:3.6.0.1398:sonar
