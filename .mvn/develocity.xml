@@ -32,7 +32,7 @@
       <buildLogging>true</buildLogging>
       <testLogging>true</testLogging>
     </capture>
-    <backgroundBuildScanUpload>#{isFalse(env['GITHUB_ACTIONS'])}</backgroundBuildScanUpload>
+    <backgroundBuildScanUpload>false</backgroundBuildScanUpload>
     <publishing>
       <onlyIf><![CDATA[authenticated]]></onlyIf>
     </publishing>
@@ -42,7 +42,7 @@
   </buildScan>
   <buildCache>
     <local>
-      <enabled>#{isFalse(env['GITHUB_ACTIONS'])}</enabled>
+      <enabled>false</enabled>
     </local>
     <remote>
       <enabled>false</enabled>
