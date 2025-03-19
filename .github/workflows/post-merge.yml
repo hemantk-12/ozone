@@ -265,7 +265,7 @@ jobs:
   coverage:
     runs-on: re-ubuntu20
     timeout-minutes: 30
-    if: false
+    if: always() && !cancelled()
     needs:
       - build-info
       - acceptance
@@ -294,17 +294,20 @@ jobs:
           mkdir -p hadoop-ozone/dist/target
           tar xzvf target/artifacts/ozone-bin/ozone*.tar.gz -C hadoop-ozone/dist/target
       - name: Calculate combined coverage
-        run: ./hadoop-ozone/dev-support/checks/coverage.sh
+        run: |
+          export JAVA_HOME=${{ env.JENKINS_TOOLS_PATH }}/jdk17/jdk-${{ env.JAVA_17_VERSION }}
+          export PATH=${{ env.JENKINS_TOOLS_PATH }}/maven/apache-maven-${{ env.MAVEN_VERSION }}/bin:$PATH
+          ./hadoop-ozone/dev-support/checks/coverage.sh
         # We need to use JDK 17 to run publish the coverage because the current Sonar version (10.x) used internally
         # doesn't support JDK 8 for analysis. 
       - name: Upload coverage to Sonar
+        env:
+          SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export JAVA_HOME=${{ env.JENKINS_TOOLS_PATH }}/jdk17/jdk-${{ env.JAVA_17_VERSION }}
           export PATH=${{ env.JENKINS_TOOLS_PATH }}/maven/apache-maven-${{ env.MAVEN_VERSION }}/bin:$PATH
           ./hadoop-ozone/dev-support/checks/sonar.sh
-        env:
-          SONAR_TOKEN: ${{ secrets.SONARCLOUD_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Archive build results
         uses: actions/upload-artifact@v3
         with:
