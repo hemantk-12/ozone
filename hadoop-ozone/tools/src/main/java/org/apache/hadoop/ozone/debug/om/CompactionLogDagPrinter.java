@@ -19,13 +19,12 @@ package org.apache.hadoop.ozone.debug.om;
 
 import static org.apache.hadoop.ozone.OzoneConsts.COMPACTION_LOG_TABLE;
 
+import com.google.protobuf.InvalidProtocolBufferException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ConcurrentHashMap;
-import com.google.protobuf.InvalidProtocolBufferException;
 import org.apache.hadoop.hdds.cli.AbstractSubcommand;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksDB;
