@@ -19,17 +19,18 @@ status: draft
   limitations under the License. See accompanying LICENSE file.
 -->
 
-# Container Reconciliation
-This document outlines the design for handling partial writes in Erasure Coded (EC) data layouts in Ozone using a Merkle tree-based reconciliation mechanism. The goal is to ensure data consistency and recoverability when partial writes occur due to node failures, network partitions, or other transient issues.
+# Erasure Coded Container Reconciliation
+This document outlines a design to detect any data inconsistencies in Erasure Coded (EC) data layouts and proposes a recovery path.
 
 ## Background
 Unlike a replicated cluster, where data is fully copied across multiple nodes, an Erasure Coded (EC) layout distributes data across multiple DataNodes with parity blocks computed for fault tolerance. The data distribution makes it challenging to apply the same Merkle tree generation method used for replicated clusters. In an EC layout, simply deriving a container’s checksum from its block checksums and a block’s checksum from its chunk checksums is not sufficient. This document proposes a method for generating the Merkle tree and container checksum specifically for EC layouts. And how that can be used to reconcile mismatched container contents.
 
 ## Nomenclature
-1. Stripe: A set of data blocks and parity blocks that together form an EC container.
-2. ReplicaIndex: The ordered index of DataNodes that comprise an EC container.
-3. BlockGroupLen: The total bytes of all data blocks in an EC container’s stripe.
-4. BlockSize: The size of each block in a replica of a stripe.
+1. Stripe: A row of data and parity chunks within a block group.
+2. ReplicaIndex: The ordered index of replica that comprise an EC container. For example, in a 3-2 EC layout, the replica indexes are 0, 1, 2 for data nodes and 3, 4 for parity nodes.
+3. StripeChecksum: A checksum generated for a stripe. Currently, it is stored at replica index 0 and parity replicas.
+4. BlockSize: The size of each block in a replica.
+5. BlockGroupLen: The total combined size of all blocks across the data replicas within the BlockGroup.
 
 ## Guiding Principles
 In addition to the principles for replicated containers, the following guidelines will steer the design and implementation for EC container reconciliation:
@@ -38,20 +39,29 @@ In addition to the principles for replicated containers, the following guideline
     - For example, the aim is not to clean up a partially written stripe caused by a node failure or network partition.
 
 ## Salient points
-- Each Datanode can detect a hole in a block and any checksum mismatches without checking across datanodes.
-- Even if there is no chunk written, a PutBlock is issued and an entry is added to the datanode.
-- Each Datanode can count the number of chunks in a cell as long as the client was able to complete all PutBlocks.
+- Each Datanode can detect a missing or corrupted chunk within block.
+- Even if there is no chunk written on the replica, a PutBlock is issued and an entry is added to the datanode.
+- Each Datanode can count the number of chunks in a block as long as the client was able to complete all PutBlocks.
 - Reconstruction of a replica index is atomic. The container is made available for reporting to SCM only after all blocks have been repaired.
 
-## Challenges
-To independently detect corruption or missing data on a DataNode, simply deriving a container’s checksum from block checksums and a block’s checksum from chunk data checksums is insufficient in an EC layout. This is because data is distributed across multiple nodes, with each node storing different chunks.
-Instead, we can generate the container checksum using a metadata checksum, which is sufficient to detect mismatches across replicas. As long as a DataNode’s RocksDB remains healthy, the metadata checksum can be trusted to identify inconsistencies across replicas. This checksum is computed based on the chunk’s offset and its health status.
-However, even though the container checksum can be generated from metadata, a mismatch may still occur if the last chunk doesn't exist from all DataNodes in the last stripe due to insufficient data. To address this, we need a mechanism to handle such cases, potentially by adding padding at the DataNode when necessary.
+## Merkle Tree for EC Containers
+To detect inconsistency in an EC layout, deriving a container checksum solely from block-level and chunk-level data checksums is not sufficient. This is because data is distributed across multiple nodes, with each node storing a different set of chunks.
 
-**Let's consider a few scenarios to understand the challenges:**
-* Case #1: Chunks exist  in all replicas of the last stripe for Block ID 1.
-* Case #2: Last chunk doesn't exist for third replica of the last stripe for Block ID 2.
-* Case #3: Last chunk doesn't exist for second and third replicas of the last stripe for Block ID 3.
+Instead, we propose generating the container level metadata checksum, which is sufficient for identifying mismatches across replicas. As long as the DataNode’s RocksDB remains intact, this metadata checksum can be reliably used to detect inconsistencies.
+
+This proposal builds upon the existing container reconciliation framework designed for replicated containers and extends it to support EC containers. A container metadata checksum is generated using a three-level Merkle tree to assess whether container replicas are consistent across the cluster.
+
+1. Level 1 (leaves): Rather than using data checksum, metadata checksum will be used in EC. Metadata checksum will be calculated based on the offset of the chunk and the health of the chunk. Health of the chunk represents that a chunk’s checksum matches the expected value (as written by the client and verified by the DataNode container scanner).
+2. Level 2: A block level metadata checksum created by hashing all chunks metadata checksums in that block.
+3. Level 3 (root): A container-level metadata checksum is generated by hashing together all the block metadata checksums within the container.
+
+The top-level container hash is reported to the SCM to detect any diverged replicas, allowing SCM to detect inconsistencies without processing block-level or chunk-level hashes and to initiate reconciliation on the DataNodes when needed.
+
+## Challenges
+Although the container checksum derived from metadata is sufficient to detect divergence across replicas, false negatives may still occur due to the metadata stored in EC layouts currently. Specifically, a mismatch can arise when the last chunk doesn't exist on some replicas due to insufficient data to populate all chunks in the stripe.
+
+**Let's consider a few scenarios to understand the challenges when data is successfully written:**
+* #1: Chunks exist in all replicas of the last stripe for Block ID 1.
 
 | Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
 |-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|---------------------------------------------------|
@@ -60,24 +70,40 @@ However, even though the container checksum can be generated from metadata, a mi
 | WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
 | WriteChunk 3          | r1c3             | r2c3             | r3c3             | r4c3                        | r5c3                        | Entire Row written                                |
 | PutBlock 1            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | PutBlock sent to all node                         |
+
+Metadata checksum will match across all replicas because all chunks are present in the replicas.
+
+* #2: Last chunk doesn't exist for third replica of the last stripe for Block ID 2.
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|---------------------------------------------------|
 | **Block ID 2**        |
 | WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
 | WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
-| WriteChunk 3          | r1c3             | r2c3             |                  | r4c3                        | r5c3                        | Entire Row written (Partial Row written)          |
-| PutBlock 3            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
+| WriteChunk 3          | r1c3             | r2c3             |                  | r4c3                        | r5c3                        | Partial Row written                               |
+| PutBlock 2            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
+
+Replica index r3's metadata checksum will not match with other replicas because the last chunk does not exist. It will trigger a false alarm for SCM to start the reconciliation process.
+
+* #3: Last chunk doesn't exist for second and third replicas of the last stripe for Block ID 3.
+
+| Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                             |
+|-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|---------------------------------------------------|
 | **Block ID 3**        |
 | WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                |
 | WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                |
-| WriteChunk 3          | r1c3             |                  |                  | r4c3                        | r5c3                        | Entire Row written (Partial Row written)          |
-| PutBlock 2            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
+| WriteChunk 3          | r1c3             |                  |                  | r4c3                        | r5c3                        | Partial Row written                               |
+| PutBlock 3            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node |
 
-For Block ID 2 and Block ID 3, block checksum will not match across the replicas because last chunk is not present everywhere in the last stripe. It will trigger a false alarm for SCM to start the reconciliation process. To avoid this, we need to add padding at the DataNode when necessary.
+Replica Indexes r2 and r3's metadata checksum will not match across all the replicas because last chunk is not present everywhere in the last stripe. It will trigger a false alarm for SCM to start the reconciliation process.
+
+To prevent false alarms, a mechanism is required to address these scenarios—potentially by adding padding to the last stripe on the affected replicas. Padding, in this context, simply refers to the expected offset of the last chunk that may be missing on certain replicas due to insufficient data, as seen in scenarios #2 and #3.
 
 ## Proposed Solution
 Proposals to avoid false alarms and handle the challenges mentioned above.
 
 ### 1. Use Replication Configuration for Padding (Preferred)
-At the end of a block, a `putBlock` is sent to all replica indexes with the `blockGroupLength` after the last stripe. By leveraging the `blockGroupLength` and the replication configuration, we can determine whether padding is needed.
+Currently, a `putBlock`  is sent to all replica indexes at the end of a block, with the `blockGroupLength` after the final stripe. This `blockGroupLength` can be used to determine whether padding is needed and to calculate the appropriate offset on a replica. However, the replication configuration is needed for calculation, which is not available to the DataNode by default. If the DataNode gets the replication configuration, it can accurately compute the necessary padding for the last stripe by following these steps:
 
 #### Steps
 1. **Calculate Total Chunks:** Compute the total number of chunks as the ceiling of `blockGroupLength` divided by the `chunkSize`.
@@ -96,7 +122,8 @@ Given: `blockGroupLength = 6400`, `chunkSize = 1024`, `dataNodes = 3`, `parityNo
 This means the last chunk is present in **row 3, replica index 1**. However, since data is striped across multiple nodes, **padding must be added** for replica indexes **2 and 3** to ensure consistency of container checksum.
 
 **Cons:**
-1. Call to SCM to get the replication configuration for padding calculation.
+1. Scanner needs to call SCM to get the replication configuration for padding calculation for existing clients.
+2. Client change to send offset to all the replica nodes even though no chunk is written on the replica.
 
 ### 2. Stripe Checksum for Padding Calculation
 In EC, a stripe checksum is generated and stored after each successful stripe write which is used to verify the stripe’s health and consistency across all replicas during reads and reconstruction. We can use it to determine whether padding is required or not for the last stripe on a replica because a stripe checksum is nothing but a successful row completion. If stripe checksum is present but chunkInfo is not, it means padding is required to generate metadata checksum.
@@ -110,7 +137,7 @@ An alternative approach is for the client to send the stripe checksum along with
 
 **Cons:**
 1. Client change to store stripe checksum on all the replica nodes.
-2. Currently, the stripe checksum is stored on the first replica node and parity nodes. To maintain backward compatibility, a request will be made to the replica nodes to retrieve and populate the missing stripe checksums on replica indexes where they are not stored.
+2. Currently, the stripe checksum is stored on the first replica node and parity nodes. To maintain backward compatibility, at the starting, scanner has to retrieve and populate the missing stripe checksums on replica indexes where they are not stored.
 
 ### 3. Reconciliation Process and Padding for the Last Stripe
 This approach is similar to second approach, but the reconciliation process is responsible for adding padding to the last stripe, rather than the scanner handling the calculation. 
@@ -127,38 +154,29 @@ This approach is similar to second approach, but the reconciliation process is r
 ### Decision
 Even though an extra call is made to SCM, first approach is simplest and efficient. It is also similar to what current replication does in case of replica is lost and can reuse the existing logic. Hence, going with this proposal.
 
-## Merkle Tree for EC Containers
-This proposal extends the container-reconciliation approach used for replicated containers to EC containers. Like replicated containers, a container-level checksum is generated to verify whether the container instances are consistent. This container checksum can be defined as a three level Merkle tree.
-
-1. Level 1 (leaves): Rather than using data checksum, in EC metadata checksum will be used. Metadata checksum will be calculated based on the offset of the chunk and the health of the chunk. Health of the chunk represents that a chunk’s checksum matches the expected value (as written by the client and verified by the DataNode container scanner).
-2. Level 2: A block level checksum created by hashing all the chunk checksums within the block.
-   - In an EC container, a putBlock is sent to all replica indexes including parities which contains the blockGroupLen and block offset.
-3. Level 3 (root): A container-level checksum is generated by hashing together all the block-level checksums within the container.
-   - This top-level container hash is reported to the SCM to detect any diverged replicas, eliminating the need for SCM to process block- or chunk-level hashes.
-
-SCM will use this container hash to identify diverged replicas and trigger reconciliation on the datanodes.
-
 ## Solution Implementation
-The structure of the Merkle Tree and its storage mechanism on DataNodes mostly remain unchanged. The only difference is in how the Merkle Tree is computed for EC containers. For details on Merkle Tree storage, APIs, and the reconciliation process, refer to the container-reconciliation doc.
+For EC containers, we maintain the same Merkle tree with the addition of a metadata checksum at each level.
 
 ```aiignore
 message ChunkMerkleTree {
   optional int64 offset = 1;
   optional int64 length = 2;
-  optional int64 chunkChecksum = 3;
-  optional int64 metadataChecksum = 4; # new attribute, based on chunk offset and health of the chunk.
-  optional int64 isHealthy = 5; # new attribute, true if chunk checksum matches with the RocksDB's value.
+  optional int64 dataChecksum = 3;
+  optional bool isHealthy = 4;
+  optional int64 metadataChecksum = 5; # new attribute, based on chunk offset and health of the chunk.
 }
 
 message BlockMerkleTree {
   optional int64 blockID = 1;
-  optional int64 blockChecksum = 2;
+  optional int64 dataChecksum = 2;
   repeated ChunkMerkleTree chunkMerkleTree = 3;
+  optional int64 metadataChecksum = 4; # new attribute, based on chunk's metadata checksum
 }
 
 message ContainerMerkleTree {
   optional int64 dataChecksum = 1;
   repeated BlockMerkleTree blockMerkleTree = 2;
+  optional int64 metadataChecksum = 3; # new attribute, based on block's metadata checksum
 }
 
 message ContainerChecksumInfo {
@@ -183,34 +201,31 @@ Reconciliation for EC containers can occur in two scenarios:
 
 ## Sample scenarios
 
-### Healthy Stripe with Unhealthy Replicas but Recoverable:
+### Unhealthy Replicas but Recoverable:
 Consider a 3-2 EC layout, where 3 data nodes have replica indexes r1, r2, & r3 and 2 parity nodes have replica indexes r4 and r5. Now, let's examine the possible scenarios:
-1. **Container is missing or has corrupted chunks**: 
+1. **Container is missing chunks or has corrupted chunks**: 
  
-   | Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                                                    |
-   |-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|--------------------------------------------------------------------------|
+   | Client->Datanode APIs | Replica Index r1 | Replica Index r2 | Replica Index r3 | Replica Index r4 (Parity 1) | Replica Index r5 (Parity 2) | Notes                                                      |
+   |-----------------------|------------------|------------------|------------------|-----------------------------|-----------------------------|------------------------------------------------------------|
    | **Block ID 1**        |                  |
-   | WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                                       |
-   | WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                                       |
-   | WriteChunk 3          | r1c3 (corrupted) | r2c3             | r3c3             | r4c3                        | r5c3                        | Entire Row written (has corrupted but recoverable chunk)                 |
-   | PutBlock 1            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | PutBlock sent to all node                                                |
+   | WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                         |
+   | WriteChunk 2          | r1c2             | r2c2             | r3c2             | r4c2                        | r5c2                        | Entire Row written                                         |
+   | WriteChunk 3          | r1c3 (corrupted) | r2c3             | r3c3             | r4c3                        | r5c3                        | Entire Row written (Has corrupted but recoverable chunk)   |
+   | PutBlock 1            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | PutBlock sent to all node                                  |
    | **Block ID 2**        |
-   | WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                                       |
-   | WriteChunk 2          | r1c2 (corrupted) | r2c2 (corrupted) |                  | r4c1                        | r5c2                        | Entire Row written (partial row written, corrupted but recoverable chunk |
-   | PutBlock 3            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node                        |
+   | WriteChunk 1          | r1c1             | r2c1             | r3c1             | r4c1                        | r5c1                        | Entire Row written                                         |
+   | WriteChunk 2          | r1c2 (corrupted) | r2c2 (corrupted) |                  | r4c1                        | r5c2                        | Partial row written (Has corrupted but recoverable chunks) |
+   | PutBlock 3            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node          |
    | **Block ID 3**        |
-   | WriteChunk 1          | r1c1             |                  |                  | r4c1 (missing)              | r5c1                        | Entire Row written (partial row written, missing but recoverable chunk)  |
-   | PutBlock 2            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node                        |
+   | WriteChunk 1          | r1c1             |                  |                  | r4c1 (missing)              | r5c1                        | Partial row written (Has missing but recoverable chunk)    |
+   | PutBlock 2            | PutBlock         | PutBlock         | PutBlock         | PutBlock                    | PutBlock                    | Partial Row written but PutBlock sent to all node          |
 
 In all the above scenarios, stripe is healthy and recoverable. On a datanode, reconciliation process will indentify the missing or corrupted chunk/s and then fetch the data form healthy replicas/parities to generate the missing or corrupted chunk/s. It will also update the block level checksum in the Merkle tree to reflect that stripe is healthy and recovered.
 
 2. **Container has corrupted blocks**: 
     Corrupted block is nothing but an extended case of missing or corrupted chunks. In this case, reconciliation process will fetch block's data chunk by chunk, and reconstruct the block and then mark the stripe as healthy.
 
-3. **PutBlock is missing**:
-   In case the last row cannot be recovered in a different scenario.
-
-### Unhealthy Stripe with Unhealthy Replicas:
+### Unhealthy Replicas and not recoverable:
 A stripe is unhealthy when there are not enough healthy data and parity blocks to reconstruct the row. The reconciler will mark the stripe as unhealthy to reflect the unrecoverable status.
 In this example, WriteChunk 3 does not have enough healthy data and parity blocks to reconstruct the row, hence reconciler will just mark it as unrecoverable. 
 
