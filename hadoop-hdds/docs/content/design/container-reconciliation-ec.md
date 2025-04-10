@@ -27,8 +27,8 @@ Unlike a replicated cluster, where data is fully copied across multiple nodes, a
 
 ## Nomenclature
 1. Stripe: A row of data and parity chunks within a block group.
-2. ReplicaIndex: The ordered index of replica that comprise an EC container. For example, in a 3-2 EC layout, the replica indexes are 0, 1, 2 for data nodes and 3, 4 for parity nodes.
-3. StripeChecksum: A checksum generated for a stripe. Currently, it is stored at replica index 0 and parity replicas.
+2. ReplicaIndex: The ordered index of replica that comprise an EC container. For example, in a 3-2 EC layout, the replica indexes are 1, 2, 3 for data nodes and 4, 5 for parity nodes.
+3. StripeChecksum: A checksum generated for a stripe. Currently, it is stored at replica index 1 and parity replicas.
 4. BlockSize: The size of each block in a replica.
 5. BlockGroupLen: The total combined size of all blocks across the data replicas within the BlockGroup.
 
